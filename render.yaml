@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: document-analysis-api
+    env: python
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+      apt-get update
+      apt-get install -y tesseract-ocr poppler-utils
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
