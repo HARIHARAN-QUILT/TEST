@@ -64,7 +64,7 @@ logging.basicConfig(
 class RequestIdFilter(logging.Filter):
     """Inject request_id into every log record."""
 
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D102
+    def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "request_id"):
             record.request_id = "-"
         return True
@@ -219,7 +219,7 @@ _circuit_breaker = CircuitBreaker()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # noqa: ANN001
+async def lifespan(app: FastAPI):
     logger.info(
         "Document Analysis API v%s starting up (host=%s port=%d)",
         API_VERSION, HOST, PORT,
@@ -252,7 +252,7 @@ app.add_middleware(
 
 # ── Middleware: inject trace ID ────────────────────────────────────────────────
 @app.middleware("http")
-async def trace_middleware(request: Request, call_next):  # noqa: ANN001
+async def trace_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
     request.state.request_id = request_id
     response = await call_next(request)
@@ -298,7 +298,6 @@ class DocumentRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("fileName must not be empty")
         cleaned = v.strip()
-        # Block path traversal
         if ".." in cleaned or "/" in cleaned or "\\" in cleaned:
             raise ValueError("fileName must not contain path separators")
         return cleaned
@@ -664,6 +663,65 @@ async def extract_text(
         raise ValueError(f"Unsupported file type: {file_type}")
 
 
+# ── Monetary amount extraction (currency only) ─────────────────────────────────
+# Currency symbols and codes
+CURRENCY_SYMBOLS = r'[₹$€£¥₩₪₱₴₮₦₸₫]'
+CURRENCY_CODES = r'(?:USD|EUR|GBP|JPY|CNY|INR|CAD|AUD|CHF|NZD|SGD|HKD|KRW|RUB|BRL|MXN|ZAR|SEK|NOK|DKK|PLN|TRY|THB|IDR|MYR|PHP|PKR|EGP|NGN|SAR|AED|ILS|KWD|QAR|OMR|BHD|LKR|BDT|NPR|UAH|VND)'
+
+# Pattern for amounts with currency symbols (e.g., ₹10,000, $99.99)
+CURRENCY_SYMBOL_PATTERN = re.compile(
+    rf'(?:{CURRENCY_SYMBOLS})\s*(\d{{1,3}}(?:,\d{{3}})*(?:\.\d{{2}})?)'
+)
+
+# Pattern for amounts with currency codes (e.g., 50 USD, 100 EUR)
+CURRENCY_CODE_PATTERN = re.compile(
+    rf'(\d{{1,3}}(?:,\d{{3}})*(?:\.\d{{2}})?)\s*{CURRENCY_CODES}'
+)
+
+# Pattern for amounts with words "dollars", "euros", etc.
+CURRENCY_WORD_PATTERN = re.compile(
+    r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s+(dollars?|euros?|pounds?|rupees?|yen|yuan|won|ruble|real|rand|krone|franc|lira|baht|ringgit|dinar|dirham)',
+    re.IGNORECASE
+)
+
+def _extract_monetary_amounts(text: str) -> list[str]:
+    """
+    Extract ONLY monetary amounts from text.
+    Returns cleaned, deduplicated list of amount strings.
+    """
+    amounts = []
+    
+    # 1. Currency symbol + number (e.g., ₹10,000, $99.99)
+    for match in CURRENCY_SYMBOL_PATTERN.finditer(text):
+        symbol = text[match.start()]  # Get the currency symbol
+        num = match.group(1)
+        amounts.append(f"{symbol}{num}")
+    
+    # 2. Number + currency code (e.g., 50 USD, 100 EUR)
+    for match in CURRENCY_CODE_PATTERN.finditer(text):
+        num = match.group(1)
+        code = text[match.start(2):match.end(2)]
+        amounts.append(f"{num} {code}")
+    
+    # 3. Number + currency word (e.g., 100 dollars, 50 euros)
+    for match in CURRENCY_WORD_PATTERN.finditer(text):
+        num = match.group(1)
+        word = match.group(2).capitalize()
+        amounts.append(f"{num} {word}")
+    
+    # Clean and deduplicate
+    cleaned = []
+    seen = set()
+    for amt in amounts:
+        amt_clean = amt.strip()
+        key = amt_clean.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(amt_clean)
+    
+    return cleaned
+
+
 # ── Regex-based entity post-processing ────────────────────────────────────────
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _PHONE_RE = re.compile(
@@ -675,6 +733,71 @@ _URL_RE = re.compile(
     r"https?://[^\s\"'<>]+"
     r"|www\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}[^\s\"'<>]*"
 )
+
+# ── Regex fallback for person name extraction ──────────────────────────────────
+# Catches "First Last", "First Middle Last", and titled names like Dr./Mr./Prof.
+_NAME_RE = re.compile(
+    r"\b(?:"
+    r"(?:Mr\.?|Mrs\.?|Ms\.?|Miss|Dr\.?|Prof\.?|Sir|Madam|Mx\.?)\s+"
+    r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}"
+    r"|"
+    r"[A-Z][a-z]{1,20}(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]{1,20}"
+    r"(?:\s+[A-Z][a-z]{1,20})?"
+    r")\b"
+)
+
+# Common title-cased words that are NOT person names — filter these out
+_NAME_STOPWORDS: frozenset[str] = frozenset({
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "January", "February", "March", "April", "June", "July", "August",
+    "September", "October", "November", "December",
+    "Invoice", "Receipt", "Report", "Summary", "Total", "Amount", "Date",
+    "Dear", "Hello", "Please", "Thank", "Regards", "Sincerely",
+    "The", "This", "That", "These", "Those", "From", "Subject",
+    "Page", "Section", "Part", "Item", "Note", "Re", "Cc", "Bcc",
+    "Attached", "Enclosed", "Herein", "Hereby", "Thereof",
+})
+
+
+def _regex_extract_names(text: str) -> list[str]:
+    """
+    Regex fallback: scan raw extracted text for likely person names.
+    Used ONLY when the AI model returns an empty names list.
+    Filters stopwords, single-token matches, and non-name casing patterns.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for match in _NAME_RE.finditer(text):
+        name = match.group().strip()
+        key = name.lower()
+        if key in seen:
+            continue
+
+        parts = name.split()
+        # Must be at least two tokens (first + last)
+        if len(parts) < 2:
+            continue
+        # No token should be a known stopword
+        if any(p in _NAME_STOPWORDS for p in parts):
+            continue
+        # Each token must look like a proper name: Title-cased, 2+ chars
+        valid = True
+        for p in parts:
+            if re.match(r'^(Mr|Mrs|Ms|Dr|Prof|Sir|Mx)\.?$', p):
+                continue
+            if re.match(r'^[A-Z]\.$', p):
+                continue
+            if not re.match(r'^[A-Z][a-z]{1,}$', p):
+                valid = False
+                break
+        if not valid:
+            continue
+
+        seen.add(key)
+        candidates.append(name)
+
+    return candidates
 
 
 def _extract_regex_entities(text: str) -> dict[str, list[str]]:
@@ -689,7 +812,7 @@ def _extract_regex_entities(text: str) -> dict[str, list[str]]:
     }
 
 
-# ── AI Prompt ──────────────────────────────────────────────────────────────────
+# ── AI Prompt (updated for monetary amounts only) ──────────────────────────────
 ANALYSIS_PROMPT = """You are an expert document analysis engine with deep expertise in business, legal, medical, and technical documents.
 
 Read the document text below carefully. It may have been extracted via OCR so minor spelling noise is possible — recover meaning contextually.
@@ -709,11 +832,29 @@ Never cut off mid-sentence. Be specific.
 
 === ENTITIES OBJECT ===
 
-"names"         Real human person names only. Exclude companies and roles.
+"names"
+!!CRITICAL!! YOU MUST EXTRACT EVERY HUMAN PERSON NAME. NEVER RETURN AN EMPTY LIST IF ANY NAME EXISTS IN THE TEXT.
+  Scan every single line including headers, footers, tables, signatures, and metadata.
+  Extract names from ALL of these patterns — do not miss any:
+    - Bare full names:           "John Smith", "Mary Jane Watson"
+    - Titled names:              "Dr. John Smith", "Mr. David Lee", "Prof. Alice Brown"
+    - Salutations:               "Dear Sarah Connor,"  →  "Sarah Connor"
+    - Signatures:                "Sincerely, James Carter"  →  "James Carter"
+    - Labeled fields:            "Prepared by: Anna Roy"  →  "Anna Roy"
+    - Document fields:           "Author: Wei Chen", "To: Lisa Park", "From: Omar Hassan"
+    - Table cells:               Any cell containing a person's full name
+    - Issued/Addressed to lines: "Issued to: Michael Brown"  →  "Michael Brown"
+    - Attn / Attention lines:    "Attn: Rachel Green"  →  "Rachel Green"
+  If OCR noise garbles a name (e.g. "J0hn Sm1th"), recover the intended name and include it.
+  Include ONLY real human person names. Exclude company names and standalone job titles.
+
 "dates"         All explicit date/time references, copied EXACTLY as written.
 "organizations" Named companies, institutions, agencies, NGOs.
-"amounts"       ALL numeric values with context: money, percentages, quantities, IDs.
-                CRITICAL — extract every single one. Never omit.
+"amounts"       ONLY monetary amounts: prices, costs, totals, fees, payments.
+                Include currency symbols (₹, $, €, £, ¥) or codes (USD, EUR, INR, GBP).
+                Examples: "₹10,000", "$99.99", "50 EUR", "£100", "€200.50"
+                DO NOT include: invoice numbers, quantities, percentages, dates, IDs.
+                If no monetary amount exists, return empty list [].
 
 === SENTIMENT ===
 
@@ -730,7 +871,7 @@ Never cut off mid-sentence. Be specific.
     "names": ["John Smith"],
     "dates": ["8/13/24", "8/27/24"],
     "organizations": ["Acme Corporation", "Beta Limited"],
-    "amounts": ["Invoice #7577", "$5.00", "$7.00", "$2.00", "$13.00", "8.20%", "$1.06", "$14.06"]
+    "amounts": ["$5.00", "$7.00", "$2.00", "$13.00", "$1.06", "$14.06"]
   }},
   "sentiment": "Neutral"
 }}
@@ -739,8 +880,6 @@ Never cut off mid-sentence. Be specific.
 {text}
 
 Respond ONLY with the JSON object. No markdown, no explanation, no extra text."""
-
-
 # ── JSON repair ────────────────────────────────────────────────────────────────
 def _repair_truncated_json(content: str) -> Optional[dict]:
     content = re.sub(r"```(?:json)?", "", content).strip().rstrip("`").strip()
@@ -904,7 +1043,7 @@ def call_openrouter(
     raise ValueError(f"OpenRouter failed after {retries} attempts: {last_error}")
 
 
-# ── Entity validation ──────────────────────────────────────────────────────────
+# ── Entity validation (with monetary amount filtering) ─────────────────────────
 def _clean_list(items: object) -> list[str]:
     if not isinstance(items, list):
         return []
@@ -921,12 +1060,30 @@ def _clean_list(items: object) -> list[str]:
     return result
 
 
+def _is_monetary_amount(amount: str) -> bool:
+    """Check if a string appears to be a monetary amount."""
+    # Check for currency symbols
+    if re.search(r'[₹$€£¥]', amount):
+        return True
+    # Check for currency codes at end
+    if re.search(rf'\s+{CURRENCY_CODES}$', amount, re.IGNORECASE):
+        return True
+    # Check for currency words at end
+    if re.search(r'\s+(dollars?|euros?|pounds?|rupees?|yen|yuan|won|ruble|real|rand|krone|franc|lira|baht|ringgit|dinar|dirham)$', amount, re.IGNORECASE):
+        return True
+    return False
+
+
 def validate_and_clean_entities(raw: dict) -> EntitiesModel:
+    # Get raw amounts and filter to keep only monetary ones
+    raw_amounts = _clean_list(raw.get("amounts", []))
+    monetary_amounts = [amt for amt in raw_amounts if _is_monetary_amount(amt)]
+    
     return EntitiesModel(
         names=_clean_list(raw.get("names", [])),
         dates=_clean_list(raw.get("dates", [])),
         organizations=_clean_list(raw.get("organizations", [])),
-        amounts=_clean_list(raw.get("amounts", [])),
+        amounts=monetary_amounts,
     )
 
 
@@ -938,7 +1095,70 @@ def validate_sentiment(raw: object) -> str:
     return "Neutral"
 
 
+# ── Name fallback: regex recovery when AI returns empty names ─────────────────
+def _merge_names_with_fallback(
+    ai_names: list[str],
+    raw_text: str,
+    request_id: str = "-",
+) -> list[str]:
+    """
+    Safety net for the names field.
 
+    - If the AI returned names: trust them and return as-is.
+    - If the AI returned zero names: run regex over the raw extracted text
+      and use those results instead.
+
+    This guarantees the names field is never silently empty when the
+    document actually contains person names. The regex fallback is only
+    activated on an empty AI result to avoid polluting good AI output
+    with false positives.
+    """
+    if ai_names:
+        return ai_names
+
+    regex_names = _regex_extract_names(raw_text)
+    if regex_names:
+        logger.info(
+            "AI returned 0 names; regex fallback recovered %d name(s): %s",
+            len(regex_names), regex_names,
+            extra={"request_id": request_id},
+        )
+    else:
+        logger.info(
+            "AI returned 0 names; regex fallback also found none — "
+            "document likely contains no person names.",
+            extra={"request_id": request_id},
+        )
+    return regex_names
+
+
+# ── Amount fallback: ensure monetary amounts are present ──────────────────────
+def _ensure_monetary_amounts(ai_amounts: list[str], raw_text: str, request_id: str = "-") -> list[str]:
+    """
+    Ensure we have monetary amounts. If AI returned empty or non-monetary,
+    fall back to regex extraction.
+    """
+    # First, filter AI amounts to keep only monetary ones
+    filtered_ai = [amt for amt in ai_amounts if _is_monetary_amount(amt)]
+    
+    if filtered_ai:
+        return filtered_ai
+    
+    # Fallback: extract directly from raw text
+    regex_amounts = _extract_monetary_amounts(raw_text)
+    if regex_amounts:
+        logger.info(
+            "AI returned non-monetary amounts; regex fallback extracted %d monetary amount(s): %s",
+            len(regex_amounts), regex_amounts[:5],
+            extra={"request_id": request_id},
+        )
+        return regex_amounts
+    
+    logger.info(
+        "No monetary amounts found in document.",
+        extra={"request_id": request_id},
+    )
+    return []
 
 
 # ── File type resolution ───────────────────────────────────────────────────────
@@ -1012,6 +1232,16 @@ async def _run_analysis_pipeline(
     entities = validate_and_clean_entities(analysis_raw.get("entities", {}))
     sentiment = validate_sentiment(analysis_raw.get("sentiment", "Neutral"))
     summary = (analysis_raw.get("summary") or "").strip() or "Unable to generate summary."
+
+    # Apply name fallback: if AI returned empty names, recover via regex
+    entities.names = _merge_names_with_fallback(
+        entities.names, extraction.text, request_id=request_id
+    )
+    
+    # Apply amount fallback: ensure only monetary amounts, fallback to regex if needed
+    entities.amounts = _ensure_monetary_amounts(
+        entities.amounts, extraction.text, request_id=request_id
+    )
 
     processing_ms = int((time.perf_counter() - t_start) * 1000)
     _record("processing_time_seconds_sum", processing_ms / 1000)
