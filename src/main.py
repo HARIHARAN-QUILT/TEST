@@ -83,7 +83,7 @@ load_dotenv()
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 API_KEY: str = os.getenv("API_KEY", "")
 HOST: str = os.getenv("HOST", "0.0.0.0")
-PORT: int = int(os.getenv("PORT", "8000"))
+PORT: int = int(os.getenv("PORT", "5000"))
 DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
 
 # Limits
